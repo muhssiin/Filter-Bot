@@ -1,44 +1,55 @@
+import os
 import importlib
 import re
+import datetime
 from typing import Optional, List
+import resource
+import platform
+import sys
+import traceback
+import requests
+from parsel import Selector
+import json
+from urllib.request import urlopen
 
 from telegram import Message, Chat, Update, Bot, User
-from telegram import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from telegram.error import Unauthorized, BadRequest, TimedOut, NetworkError, ChatMigrated, TelegramError
 from telegram.ext import CommandHandler, Filters, MessageHandler, CallbackQueryHandler
-from telegram.ext.dispatcher import run_async, DispatcherHandlerStop
+from telegram.ext.dispatcher import run_async, DispatcherHandlerStop, Dispatcher
 from telegram.utils.helpers import escape_markdown
+from bot import dispatcher, updater, TOKEN, WEBHOOK, SUDO_USERS, OWNER_ID, CERT_PATH, PORT, URL, LOGGER, OWNER_NAME, ALLOW_EXCL
+from bot.modules import ALL_MODULES
+from bot.modules.helper_funcs.chat_status import is_user_admin
+from bot.modules.helper_funcs.misc import paginate_modules
+from bot.modules.connection import connected
+from bot.modules.connection import connect_button
 
-from tg_bot import dispatcher, updater, TOKEN, WEBHOOK, OWNER_ID, DONATION_LINK, CERT_PATH, PORT, URL, LOGGER, \
-    ALLOW_EXCL
-# needed to dynamically load modules
-# NOTE: Module order is not guaranteed, specify that in the config file!
-from tg_bot.modules import ALL_MODULES
-from tg_bot.modules.helper_funcs.chat_status import is_user_admin
-from tg_bot.modules.helper_funcs.misc import paginate_modules
 
 PM_START_TEXT = """
-*Hello* {},*My Name is* *{}*! 
+*Hello* *{}*
+*My name is* *{}*\n\n`You Can Add any kind of Filters to This Bot!`
 
-```You You Can Add any kind of Filters to This Bot!```
-
-*Channel:© @MCubeMediaOfficial*
 
 HELP_STRINGS = """
-Hello! my name *{}*.
-
-*Main Available Commands* are Below:
-
+*Hello My name is* *{}*.
+*Main Available Commands are Below:*
 All of the following commands  / can  be used...
-
 And the following:
-""".format(dispatcher.bot.first_name, "" if not ALLOW_EXCL else "\nഈ പറഞ്ഞിരിക്കുന്ന commandകൾ എല്ലാം  / അല്ലെങ്കിൽ ! വെച്ച് ഉപയോഗിക്കാവുന്നതാണ്...\n")
+""".format(dispatcher.bot.first_name, "" if not ALLOW_EXCL else "\nAll commands can either be used with / or !.\n")
 
-DONATE_STRING = """Heya, glad to hear you want to donate!
-It took lots of work for [my creator](t.me/sonoflars) to get me to where I am now, and every donation helps \
-motivate him to make me even better. All the donation money will go to a better VPS to host me, and/or beer \
-(see his bio!). He's just a poor student, so every little helps!
-There are two ways of paying him; [PayPal](paypal.me/PaulSonOfLars), or [Monzo](monzo.me/paulnionvestergaardlarsen)."""
+
+
+VERSION = "6.0"
+
+def vercheck() -> str:
+    return str(VERSION)
+
+
+SOURCE_STRING = """
+☹️*Sorry Broh*
+"""
+
 
 IMPORTED = {}
 MIGRATEABLE = []
@@ -51,8 +62,16 @@ DATA_EXPORT = []
 CHAT_SETTINGS = {}
 USER_SETTINGS = {}
 
+GDPR = []
+
+START_IMG = os.environ.get('START_IMG', None)
+if START_IMG is None:
+    img = "https://telegra.ph/file/fc734b227985a1524e715.jpg"
+else:
+  img = START_IMG    
+    
 for module_name in ALL_MODULES:
-    imported_module = importlib.import_module("tg_bot.modules." + module_name)
+    imported_module = importlib.import_module("bot.modules." + module_name)
     if not hasattr(imported_module, "__mod_name__"):
         imported_module.__mod_name__ = imported_module.__name__
 
@@ -70,6 +89,9 @@ for module_name in ALL_MODULES:
 
     if hasattr(imported_module, "__stats__"):
         STATS.append(imported_module)
+
+    if hasattr(imported_module, "__gdpr__"):
+        GDPR.append(imported_module)
 
     if hasattr(imported_module, "__user_info__"):
         USER_INFO.append(imported_module)
@@ -107,6 +129,9 @@ def test(bot: Bot, update: Update):
 
 @run_async
 def start(bot: Bot, update: Update, args: List[str]):
+    print("Start")
+    chat = update.effective_chat  # type: Optional[Chat]
+    query = update.callback_query
     if update.effective_chat.type == "private":
         if len(args) >= 1:
             if args[0].lower() == "help":
@@ -117,20 +142,41 @@ def start(bot: Bot, update: Update, args: List[str]):
                 chat = dispatcher.bot.getChat(match.group(1))
 
                 if is_user_admin(chat, update.effective_user.id):
-                    send_settings(match.group(1), update.effective_user.id, False)
+                    send_settings(match.group(1), update.effective_user.id, user=False)
                 else:
-                    send_settings(match.group(1), update.effective_user.id, True)
+                    send_settings(match.group(1), update.effective_user.id, user=True)
 
             elif args[0][1:].isdigit() and "rules" in IMPORTED:
                 IMPORTED["rules"].send_rules(update, args[0], from_pm=True)
 
         else:
-            first_name = update.effective_user.first_name
-            update.effective_message.reply_text(
-                PM_START_TEXT.format(escape_markdown(first_name), escape_markdown(bot.first_name), OWNER_ID),
-                parse_mode=ParseMode.MARKDOWN,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text="MCubeMovies", url="t.me/mcubemediaofficial".format(bot.username))]]))
+            send_start(bot, update)
     else:
-        update.effective_message.reply_text("")
+        update.effective_message.reply_text("Heya,{} Here..\nHow can I help you? 🙂".format(bot.first_name),reply_markup=InlineKeyboardMarkup(
+                                                [[InlineKeyboardButton(text="⚙️Help",url="t.me/{}?start=help".format(bot.username))]]))
+
+def send_start(bot, update):
+    #Try to remove old message
+    try:
+        query = update.callback_query
+        query.message.delete()
+    except:
+        pass
+
+    chat = update.effective_chat  # type: Optional[Chat]
+    first_name = update.effective_user.first_name 
+    text = PM_START_TEXT
+
+    keyboard = [[InlineKeyboardButton(text="⚙️Help",callback_data="help_back"),InlineKeyboardButton(text="Channel",url="https://t.me/mcubemediaofficial")]]
+    keyboard += [[InlineKeyboardButton(text="♻️Connect Group", callback_data="main_connect"),InlineKeyboardButton(text="Add Me➕",url="t.me/{}?startgroup=true".format(bot.username))]]
+
+    update.effective_message.reply_photo(img, PM_START_TEXT.format(escape_markdown(first_name), escape_markdown(bot.first_name), OWNER_NAME, OWNER_ID), 
+                                         reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True, parse_mode=ParseMode.MARKDOWN)
+
+
+def m_connect_button(bot, update):
+    bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
+    connect_button(bot, update)
 
 
 # for test purposes
@@ -222,9 +268,8 @@ def get_help(bot: Bot, update: Update):
 
         update.effective_message.reply_text("Contact me in PM to get the list of possible commands.",
                                             reply_markup=InlineKeyboardMarkup(
-                                                [[InlineKeyboardButton(text="Help",
-                                                                       url="t.me/{}?start=help".format(
-                                                                           bot.username))]]))
+                                                [[InlineKeyboardButton(text="⚙️Help",url="t.me/{}?start=help".format(bot.username))],  
+                                                [InlineKeyboardButton(text="😴Contact Creator",url="https://t.me/DL_tg")]]))
         return
 
     elif len(args) >= 2 and any(args[1].lower() == x for x in HELPABLE):
@@ -263,6 +308,9 @@ def send_settings(chat_id, user_id, user=False):
                                         parse_mode=ParseMode.MARKDOWN)
 
 
+    
+
+
 @run_async
 def settings_button(bot: Bot, update: Update):
     query = update.callback_query
@@ -277,7 +325,8 @@ def settings_button(bot: Bot, update: Update):
             module = mod_match.group(2)
             chat = bot.get_chat(chat_id)
             text = "*{}* has the following settings for the *{}* module:\n\n".format(escape_markdown(chat.title),
-                                                                                     CHAT_SETTINGS[module].__mod_name__) + \
+                                                                                     CHAT_SETTINGS[
+                                                                                         module].__mod_name__) + \
                    CHAT_SETTINGS[module].__chat_settings__(chat_id, user.id)
             query.message.reply_text(text=text,
                                      parse_mode=ParseMode.MARKDOWN,
@@ -341,7 +390,7 @@ def get_settings(bot: Bot, update: Update):
             text = "Click here to get this chat's settings, as well as yours."
             msg.reply_text(text,
                            reply_markup=InlineKeyboardMarkup(
-                               [[InlineKeyboardButton(text="Settings",
+                               [[InlineKeyboardButton(text="⚙️Settings",
                                                       url="t.me/{}?start=stngs_{}".format(
                                                           bot.username, chat.id))]]))
         else:
@@ -351,26 +400,6 @@ def get_settings(bot: Bot, update: Update):
         send_settings(chat.id, user.id, True)
 
 
-@run_async
-def donate(bot: Bot, update: Update):
-    user = update.effective_message.from_user
-    chat = update.effective_chat  # type: Optional[Chat]
-
-    if chat.type == "private":
-        update.effective_message.reply_text(DONATE_STRING, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-        if OWNER_ID != 254318997 and DONATION_LINK:
-            update.effective_message.reply_text("You can also donate to the person currently running me "
-                                                "[here]({})".format(DONATION_LINK),
-                                                parse_mode=ParseMode.MARKDOWN)
-
-    else:
-        try:
-            bot.send_message(user.id, DONATE_STRING, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-            update.effective_message.reply_text("I've PM'ed you about donating to my creator!")
-        except Unauthorized:
-            update.effective_message.reply_text("Contact me in PM first to get donation information.")
 
 
 def migrate_chats(bot: Bot, update: Update):
@@ -392,18 +421,145 @@ def migrate_chats(bot: Bot, update: Update):
     raise DispatcherHandlerStop
 
 
+@run_async
+def source(bot: Bot, update: Update):
+    user = update.effective_message.from_user
+    chat = update.effective_chat  # type: Optional[Chat]
+
+    if chat.type == "private":
+        update.effective_message.reply_text(SOURCE_STRING, parse_mode=ParseMode.MARKDOWN)
+
+    else:
+        try:
+            bot.send_message(user.id, SOURCE_STRING, parse_mode=ParseMode.MARKDOWN)
+
+            update.effective_message.reply_text("You'll find in PM more info about my sourcecode.")
+        except Unauthorized:
+            update.effective_message.reply_text("Contact me in PM first to get source information.")
+
+@run_async
+def imdb_searchdata(bot: Bot, update: Update):
+    query_raw = update.callback_query
+    query = query_raw.data.split('$')
+    print(query)
+    if query[1] != query_raw.from_user.username:
+        return
+    title = ''
+    rating = ''
+    date = ''
+    synopsis = ''
+    url_sel = 'https://www.imdb.com/title/%s/' % (query[0])
+    text_sel = requests.get(url_sel).text
+    selector_global = Selector(text = text_sel)
+    title = selector_global.xpath('//div[@class="title_wrapper"]/h1/text()').get().strip()
+    try:
+        rating = selector_global.xpath('//div[@class="ratingValue"]/strong/span/text()').get().strip()
+    except:
+        rating = '-'
+    try:
+        date = '(' + selector_global.xpath('//div[@class="title_wrapper"]/h1/span/a/text()').getall()[-1].strip() + ')'
+    except:
+        date = selector_global.xpath('//div[@class="subtext"]/a/text()').getall()[-1].strip()
+    try:
+        synopsis_list = selector_global.xpath('//div[@class="summary_text"]/text()').getall()
+        synopsis = re.sub(' +',' ', re.sub(r'\([^)]*\)', '', ''.join(sentence.strip() for sentence in synopsis_list)))
+    except:
+        synopsis = '_No synopsis available._'
+    movie_data = '*%s*, _%s_\n★ *%s*\n\n%s' % (title, date, rating, synopsis)
+    query_raw.edit_message_text(
+        movie_data, 
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@run_async
+def imdb(bot: Bot, update: Update, args):
+    message = update.effective_message
+    query = ''.join([arg + '_' for arg in args]).lower()
+    if not query:
+        bot.send_message(
+            message.chat.id,
+            'You need to specify a movie/show name!'
+        )
+        return
+    url_suggs = 'https://v2.sg.media-imdb.com/suggests/%s/%s.json' % (query[0], query)
+    json_url = urlopen(url_suggs)
+    suggs_raw = ''
+    for line in json_url:
+        suggs_raw = line
+    skip_chars = 6 + len(query)
+    suggs_dict = json.loads(suggs_raw[skip_chars:][:-1])
+    if suggs_dict:
+        button_list = [[
+                InlineKeyboardButton(
+                    text = str(sugg['l'] + ' (' + str(sugg['y']) + ')'), 
+                    callback_data = str(sugg['id']) + '$' + str(message.from_user.username)
+                )] for sugg in suggs_dict['d'] if 'y' in sugg
+        ]
+        reply_markup = InlineKeyboardMarkup(button_list)
+        bot.send_message(
+            message.chat.id,
+            'Which one? ',
+            reply_markup = reply_markup
+        )
+    else:
+        pass             
+            
+            
+# Avoid memory dead
+def memory_limit(percentage: float):
+    if platform.system() != "Linux":
+        print('Only works on linux!')
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (int(get_memory() * 1024 * percentage), hard))
+
+def get_memory():
+    with open('/proc/meminfo', 'r') as mem:
+        free_memory = 0
+        for i in mem:
+            sline = i.split()
+            if str(sline[0]) in ('MemFree:', 'Buffers:', 'Cached:'):
+                free_memory += int(sline[1])
+    return free_memory
+
+def memory(percentage=0.5):
+    def decorator(function):
+        def wrapper(*args, **kwargs):
+            memory_limit(percentage)
+            try:
+                function(*args, **kwargs)
+            except MemoryError:
+                mem = get_memory() / 1024 /1024
+                print('Remain: %.2f GB' % mem)
+                sys.stderr.write('\n\nERROR: Memory Exception\n')
+                sys.exit(1)
+        return wrapper
+    return decorator
+
+
+@memory(percentage=0.8)
 def main():
     test_handler = CommandHandler("test", test)
     start_handler = CommandHandler("start", start, pass_args=True)
+    
+    IMDB_HANDLER = CommandHandler('imdb', imdb, pass_args=True)
+    IMDB_SEARCHDATAHANDLER = CallbackQueryHandler(imdb_searchdata)
+   
+    start_callback_handler = CallbackQueryHandler(send_start, pattern=r"bot_start")
+    dispatcher.add_handler(start_callback_handler)
+
 
     help_handler = CommandHandler("help", get_help)
     help_callback_handler = CallbackQueryHandler(help_button, pattern=r"help_")
 
     settings_handler = CommandHandler("settings", get_settings)
     settings_callback_handler = CallbackQueryHandler(settings_button, pattern=r"stngs_")
-
-    donate_handler = CommandHandler("donate", donate)
+   
+    source_handler = CommandHandler("source", source)
+    
     migrate_handler = MessageHandler(Filters.status_update.migrate, migrate_chats)
+
+    M_CONNECT_BTN_HANDLER = CallbackQueryHandler(m_connect_button, pattern=r"main_connect")
 
     # dispatcher.add_handler(test_handler)
     dispatcher.add_handler(start_handler)
@@ -412,13 +568,17 @@ def main():
     dispatcher.add_handler(help_callback_handler)
     dispatcher.add_handler(settings_callback_handler)
     dispatcher.add_handler(migrate_handler)
-    dispatcher.add_handler(donate_handler)
+    dispatcher.add_handler(source_handler)
+    dispatcher.add_handler(M_CONNECT_BTN_HANDLER)
+    dispatcher.add_handler(IMDB_HANDLER)
+    dispatcher.add_handler(IMDB_SEARCHDATAHANDLER)
+    
 
     # dispatcher.add_error_handler(error_callback)
 
     if WEBHOOK:
         LOGGER.info("Using webhooks.")
-        updater.start_webhook(listen="0.0.0.0",
+        updater.start_webhook(listen="127.0.0.1",
                               port=PORT,
                               url_path=TOKEN)
 
@@ -429,12 +589,12 @@ def main():
             updater.bot.set_webhook(url=URL + TOKEN)
 
     else:
-        LOGGER.info("Using long polling.")
+        LOGGER.info("bot running...")
         updater.start_polling(timeout=15, read_latency=4)
 
     updater.idle()
 
-
+    
 if __name__ == '__main__':
     LOGGER.info("Successfully loaded modules: " + str(ALL_MODULES))
     main()
